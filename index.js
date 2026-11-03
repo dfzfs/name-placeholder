@@ -1,8 +1,7 @@
 /* Name Swap - SillyTavern extension
  * Temporarily replace the {{char}} and {{user}} names for the current chat only.
  * Group chats: each group member can be renamed separately.
- * The replacement happens on the final prompt sent to the AI; chat text on screen
- * and the character card are never modified. */
+ * Names are also temporarily swapped in visible chat/card DOM without changing saved data. */
 
 const MODULE_NAME = 'name_swap';
 const META_KEY = 'name_swap';
@@ -129,6 +128,111 @@ function onCombinePrompts(result) {
     }
 }
 
+
+/* ---------------------------------------------------------- visible name swap */
+
+// Keep original DOM text so repeated scans never compound replacements.
+// This is presentation-only: chat metadata, character objects and saved messages are untouched.
+const visibleTextState = new WeakMap();
+const visibleAttrState = new WeakMap();
+let visibleObserver = null;
+
+function applyVisibleNames(root = document.body) {
+    if (!root) return;
+    const swap = makeSwapper(buildSwapMap());
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+        acceptNode(node) {
+            const parent = node.parentElement;
+            if (!parent || parent.closest(`#${MODULE_NAME}_settings, #ns_input_button, script, style, textarea, input, [contenteditable="true"]`)) {
+                return NodeFilter.FILTER_REJECT;
+            }
+            return NodeFilter.FILTER_ACCEPT;
+        },
+    });
+    let node;
+    while ((node = walker.nextNode())) {
+        let state = visibleTextState.get(node);
+        if (!state) {
+            state = { original: node.nodeValue, rendered: null };
+            visibleTextState.set(node, state);
+        } else if (node.nodeValue !== state.rendered) {
+            // The application reused this node for fresh content.
+            state.original = node.nodeValue;
+        }
+        const next = swap ? swap(state.original) : state.original;
+        if (node.nodeValue !== next) node.nodeValue = next;
+        state.rendered = next;
+    }
+
+    // Names in image labels/tooltips are commonly used by character cards and avatars.
+    const attrs = ['title', 'alt', 'aria-label'];
+    const elements = root.querySelectorAll ? [ ...(root.matches?.('*') ? [root] : []), ...root.querySelectorAll('[title], [alt], [aria-label]') ] : [];
+    for (const el of elements) {
+        if (el.closest?.(`#${MODULE_NAME}_settings, #ns_input_button`)) continue;
+        let state = visibleAttrState.get(el);
+        if (!state) {
+            state = {};
+            visibleAttrState.set(el, state);
+        }
+        for (const attr of attrs) {
+            if (!el.hasAttribute(attr)) continue;
+            const current = el.getAttribute(attr);
+            if (!(attr in state)) state[attr] = { original: current, rendered: null };
+            else if (current !== state[attr].rendered) state[attr].original = current;
+            const next = swap ? swap(state[attr].original) : state[attr].original;
+            if (current !== next) el.setAttribute(attr, next);
+            state[attr].rendered = next;
+        }
+    }
+}
+
+function startVisibleNameSwap() {
+    applyVisibleNames();
+    if (visibleObserver) visibleObserver.disconnect();
+    visibleObserver = new MutationObserver((mutations) => {
+        // Avoid rescanning for our own characterData-only edits.
+        if (mutations.some((m) => m.type !== 'characterData' || m.target.nodeValue !== visibleTextState.get(m.target)?.rendered)) {
+            applyVisibleNames();
+        }
+    });
+    visibleObserver.observe(document.body, { childList: true, subtree: true, characterData: true });
+}
+
+function addInputHeartButton() {
+    if (document.getElementById('ns_input_button')) return;
+    const sendForm = document.querySelector('#send_form');
+    if (!sendForm) return;
+    const host = sendForm.querySelector('.extraMesButtons, #leftSendForm, .leftSendForm, .send_form') || sendForm;
+    const button = document.createElement('button');
+    button.id = 'ns_input_button';
+    button.type = 'button';
+    button.className = 'menu_button ns-input-heart';
+    button.title = 'Name Swap 열기';
+    button.setAttribute('aria-label', 'Name Swap 열기');
+    button.innerHTML = '<i class="fa-solid fa-heart" aria-hidden="true"></i>';
+    button.addEventListener('click', () => {
+        const settings = document.getElementById(`${MODULE_NAME}_settings`);
+        if (!settings) return;
+        const toggle = settings.querySelector('.inline-drawer-toggle');
+        // Open the extensions drawer first when it is currently closed.
+        const extensionPanel = document.getElementById('extensions');
+        if (extensionPanel && getComputedStyle(extensionPanel).display === 'none') {
+            document.getElementById('extensions_button')?.click();
+        }
+        setTimeout(() => {
+            toggle?.click();
+            settings.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }, 80);
+    });
+    host.prepend(button);
+}
+
+function startInputButtonWatcher() {
+    addInputHeartButton();
+    const observer = new MutationObserver(() => addInputHeartButton());
+    observer.observe(document.body, { childList: true, subtree: true });
+}
+
 /* ----------------------------------------------------------------- actions */
 
 async function saveOverride(override) {
@@ -166,6 +270,7 @@ async function applyNames() {
     try {
         await saveOverride(next);
         renderStatus();
+        applyVisibleNames();
         toastr.success('이 채팅의 이름을 적용했어요.');
     } catch (err) {
         console.error(`[${MODULE_NAME}]`, err);
@@ -179,6 +284,7 @@ async function resetNames() {
         await saveOverride({ char: '', user: '', members: {} });
         syncInputs();
         renderStatus();
+        applyVisibleNames();
         toastr.info('원래 이름으로 되돌렸어요.');
     } catch (err) {
         console.error(`[${MODULE_NAME}]`, err);
@@ -315,7 +421,7 @@ function createSettingsUI() {
                     <button id="ns_apply" class="menu_button"><i class="fa-solid fa-check"></i> 적용</button>
                     <button id="ns_reset" class="menu_button"><i class="fa-solid fa-rotate-left"></i> 원래 이름으로</button>
                 </div>
-                <div class="ns-hint">AI에게 보내는 프롬프트에서만 바뀌어요. 화면의 글과 캐릭터 카드는 그대로예요.</div>
+                <div class="ns-hint">프롬프트와 화면에 보이는 이름을 함께 바꿔요. 원본 대화와 캐릭터 데이터는 수정하지 않아요.</div>
 
                 <h4>저장된 이름</h4>
                 <div class="ns-add-row">
@@ -388,10 +494,13 @@ function createSettingsUI() {
 
     eventSource.on(event_types.APP_READY, () => {
         createSettingsUI();
+        startVisibleNameSwap();
+        startInputButtonWatcher();
         eventSource.on(event_types.CHAT_CHANGED, () => {
             syncInputs();
             renderStatus();
             renderSavedNames();
+            applyVisibleNames();
         });
         console.log(`[${MODULE_NAME}] Loaded`);
     });
